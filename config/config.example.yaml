@@ -1,0 +1,148 @@
+# ---------------------------------------------------------------------------
+# Coinbase trading bot — example configuration
+#
+# Copy this file to config/config.yaml and edit it:
+#
+#     cp config/config.example.yaml config/config.yaml
+#
+# config/config.yaml is git-ignored so your settings stay local.
+#
+# NEVER put API keys in this file. Credentials are read from environment
+# variables only (see the README). A key committed to git is a key you have
+# to assume is compromised.
+# ---------------------------------------------------------------------------
+
+api:
+  # Leave blank. Set COINBOT_API_KEY and COINBOT_API_SECRET in your shell,
+  # or point key_file at the JSON file Coinbase gave you when you made the key.
+  key_file: ""
+  timeout_s: 20.0
+  rate_limit_per_sec: 8.0     # stay under Coinbase's request cap
+
+trading:
+  # Which markets to trade. Start with one until you trust it.
+  products:
+    - BTC-USD
+    - ETH-USD
+
+  quote_currency: USD
+
+  # Bar size the bot makes decisions on. Shorter = more trades = more fees.
+  # FIVE_MINUTE is a reasonable default. Options: ONE_MINUTE, FIVE_MINUTE,
+  # FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, TWO_HOUR, SIX_HOUR, ONE_DAY.
+  granularity: FIVE_MINUTE
+
+  # A slower timeframe used only to confirm direction. The bot will not buy a
+  # 5-minute bounce inside an hourly downtrend.
+  htf_granularity: ONE_HOUR
+
+  warmup_bars: 300            # history loaded before trading starts
+  max_candles: 400            # history retained (2x the slowest indicator)
+
+  # true  = decide but never send orders (safe)
+  # false = send real orders
+  # `coinbot paper` ignores this and always simulates.
+  dry_run: true
+
+  # Spot accounts cannot short. Leave false unless you know otherwise.
+  allow_shorts: false
+
+risk:
+  # ---- Position sizing -----------------------------------------------------
+  # Fraction of equity risked per trade, measured to the stop. 0.0075 = 0.75%.
+  # This is the single most important number here. Raising it does not
+  # "make more money"; it makes both outcomes larger.
+  risk_per_trade_pct: 0.0075
+
+  max_position_pct: 0.25      # no single position above 25% of equity
+  min_position_notional: 10.0 # skip trades too small to be worth the fees
+  use_vol_targeting: true     # shrink size when an asset gets volatile
+  target_annual_vol: 0.60
+
+  # ---- How much can be at risk at once ------------------------------------
+  max_open_positions: 4
+  max_gross_exposure_pct: 0.90
+  correlation_cap: 0.85       # BTC and ETH move together; treat as one bet
+
+  # ---- Stops ---------------------------------------------------------------
+  atr_stop_multiple: 2.2      # initial stop, in units of recent volatility
+  atr_trail_multiple: 3.0     # trailing stop distance
+  use_trailing_stop: true
+  breakeven_at_r: 1.0         # move stop to entry after +1x the risked amount
+  take_profit_r: 2.5
+  max_bars_in_trade: 288      # give up on a trade going nowhere
+  hard_stop_pct: 0.12         # absolute backstop per position
+
+  # ---- Circuit breakers: these stop the bot ---------------------------------
+  # Losing days happen. These decide how bad it gets before the bot stops
+  # on its own. A drawdown halt does NOT clear itself — that is deliberate.
+  daily_loss_limit_pct: 0.03
+  weekly_loss_limit_pct: 0.07
+  max_drawdown_pct: 0.15
+  max_consecutive_losses: 6
+  halt_on_drawdown: true
+
+  # ---- Execution guards ----------------------------------------------------
+  max_spread_bps: 25.0        # refuse to enter when the market is dislocated
+
+execution:
+  order_type: limit           # limit = pay lower fees; market = fill for sure
+  post_only: false
+  limit_offset_bps: 2.0
+  chase_limit_bars: 2         # re-price this many times, then cross the spread
+
+  # Fee assumptions for paper/backtest. `coinbot run` replaces these with your
+  # real fee tier. Do not lower them to make a backtest look better.
+  taker_fee_bps: 60.0
+  maker_fee_bps: 40.0
+  slippage_bps: 5.0
+
+regime:
+  # Thresholds for classifying the market. The defaults are sane; changing
+  # these changes which strategies are allowed to trade and when.
+  adx_trend_threshold: 23.0   # above this, the market counts as trending
+  adx_strong_threshold: 35.0
+  high_vol_pct: 0.045         # ATR above this share of price = volatile
+  low_vol_pct: 0.012
+  crash_return_pct: -0.07     # this drop, over crash_lookback bars, = crash
+  crash_lookback: 12
+  hysteresis_bars: 2          # bars a new regime must persist before switching
+
+strategy:
+  enabled:
+    - trend_follow
+    - breakout
+    - mean_reversion
+    - range_scalp
+    - squeeze_break
+
+  min_signal_strength: 0.35   # raise for fewer, higher-conviction trades
+  require_htf_alignment: true
+
+  # Which strategies may trade in each market condition, and how loudly.
+  # CRASH is intentionally empty: when the market falls out of bed the bot
+  # stands aside rather than trying to be clever.
+  routing:
+    TRENDING_UP:   {trend_follow: 1.0, breakout: 0.8, squeeze_break: 0.6}
+    TRENDING_DOWN: {trend_follow: 1.0, breakout: 0.6, squeeze_break: 0.4}
+    RANGING:       {mean_reversion: 1.0, range_scalp: 0.7}
+    VOLATILE_CHOP: {mean_reversion: 0.4}
+    SQUEEZE:       {squeeze_break: 1.0, breakout: 0.5}
+    CRASH:         {}
+    UNKNOWN:       {}
+
+storage:
+  # Open positions, stops and the drawdown peak live here. Deleting this file
+  # makes the bot forget it was ever in a trade, so keep it.
+  db_path: state/coinbot.sqlite3
+
+logging:
+  level: INFO
+  file: logs/coinbot.log
+  console: true
+
+backtest:
+  initial_equity: 10000.0
+  fee_bps: 60.0
+  slippage_bps: 5.0
+  data_dir: data

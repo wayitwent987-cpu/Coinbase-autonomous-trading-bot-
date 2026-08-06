@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Secrets — never commit API keys
+.env
+*.pem
+config/config.yaml
+config/*.local.yaml
+cdp_api_key.json
+
+# Runtime state
+state/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# Test / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/

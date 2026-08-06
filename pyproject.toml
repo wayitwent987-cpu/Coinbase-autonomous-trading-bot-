@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coinbot"
+version = "1.0.0"
+description = "Regime-aware autonomous trading bot for Coinbase Advanced Trade"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["coinbase", "trading", "cryptocurrency", "algorithmic-trading"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+# Pure Python by design — no numpy, no compilers, installs anywhere.
+dependencies = [
+    "requests>=2.31",
+    "PyJWT>=2.8",
+    "cryptography>=41.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+ws = ["websockets>=12.0"]
+dev = ["pytest>=7.4", "websockets>=12.0"]
+
+[project.scripts]
+coinbot = "coinbot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["coinbot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -1,0 +1,11 @@
+# Runtime dependencies.
+#
+# Deliberately minimal: every indicator is pure Python, so there is no numpy
+# or pandas to compile. This installs in seconds on a stock macOS Python.
+requests>=2.31          # HTTP to the Coinbase REST API
+PyJWT>=2.8              # signs each request (Coinbase CDP keys)
+cryptography>=41.0       # EC / Ed25519 key handling for PyJWT
+PyYAML>=6.0             # config files
+
+# Optional — install with: pip install -r requirements-dev.txt
+# websockets>=12.0      # live ticker feed (the bot works fine without it)
