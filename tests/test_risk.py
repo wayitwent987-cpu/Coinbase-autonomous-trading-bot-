@@ -394,3 +394,85 @@ def test_initial_stop_caps_absurd_width(features):
     manager = RiskManager(RiskConfig(hard_stop_pct=0.10))
     stop = manager.initial_stop(Decimal("100"), 1, features, proposed=Decimal("10"))
     assert stop >= Decimal("90")
+
+
+# --------------------------------------------------------------------------- #
+# Portfolio-level exits
+#
+# `take_profit_r` was documented and validated but never read by anything, so
+# changing it did nothing at all. These tests pin down both halves of the fix:
+# it now supplies a target when a strategy offers none, and the explicit
+# override lets it take charge of every strategy at once.
+# --------------------------------------------------------------------------- #
+
+
+def _size(manager, product, features, book, *, stop, target):
+    return manager.size_position(
+        product=product, price=Decimal("100"), direction=1, stop_price=stop,
+        conviction=1.0, equity=EQUITY, available_cash=EQUITY, book=book,
+        features=features, take_profit=target,
+    )
+
+
+def test_take_profit_r_fills_in_a_missing_target(product, features, book):
+    """A strategy that proposes no target gets one at take_profit_r x risk."""
+    manager = RiskManager(RiskConfig(take_profit_r=3.0))
+    result = _size(manager, product, features, book, stop=Decimal("95"), target=None)
+    # Risk is 5 points, so a 3R target sits 15 points above a 100 entry.
+    assert result.take_profit == pytest.approx(Decimal("115"), abs=Decimal("0.01"))
+
+
+def test_zero_take_profit_r_means_no_target(product, features, book):
+    manager = RiskManager(RiskConfig(take_profit_r=0.0))
+    result = _size(manager, product, features, book, stop=Decimal("95"), target=None)
+    assert result.take_profit is None
+
+
+def test_a_strategy_target_wins_by_default(product, features, book):
+    manager = RiskManager(RiskConfig(take_profit_r=3.0))
+    result = _size(
+        manager, product, features, book, stop=Decimal("95"), target=Decimal("108")
+    )
+    assert result.take_profit == Decimal("108")
+
+
+def test_the_override_takes_the_target_away_from_the_strategy(product, features, book):
+    """Both levels come from the config: an ATR stop, and a target 3R off it."""
+    manager = RiskManager(
+        RiskConfig(take_profit_r=3.0, override_strategy_exits=True)
+    )
+    result = _size(
+        manager, product, features, book, stop=Decimal("95"), target=Decimal("108")
+    )
+    assert result.take_profit != Decimal("108")
+    assert result.stop_price != Decimal("95")
+    # Whatever the ATR stop worked out to, the target is exactly 3R beyond it.
+    risk_distance = Decimal("100") - result.stop_price
+    assert result.take_profit == pytest.approx(
+        Decimal("100") + 3 * risk_distance, abs=Decimal("0.01")
+    )
+
+
+def test_the_override_takes_the_stop_away_from_the_strategy(product, features, book):
+    """Otherwise the position would be sized off one stop and protected by another."""
+    plain = RiskManager(RiskConfig(atr_stop_multiple=2.0))
+    overridden = RiskManager(
+        RiskConfig(atr_stop_multiple=2.0, override_strategy_exits=True)
+    )
+    proposed = Decimal("99")  # much tighter than 2 x ATR
+
+    assert plain.initial_stop(Decimal("100"), 1, features, proposed) == proposed
+    assert overridden.initial_stop(Decimal("100"), 1, features, proposed) != proposed
+
+
+def test_the_target_is_measured_off_the_clamped_stop(product, features, book):
+    """A stop wider than hard_stop_pct gets clamped; the target must follow it.
+
+    Measuring the target off the pre-clamp distance would advertise a
+    reward-to-risk the position does not actually have.
+    """
+    manager = RiskManager(RiskConfig(take_profit_r=2.0, hard_stop_pct=0.05))
+    result = _size(manager, product, features, book, stop=Decimal("70"), target=None)
+    # The stop is clamped to 5% (95), leaving 5 points of risk, so 2R is 110 —
+    # not the 160 that the unclamped 30-point distance would have implied.
+    assert result.take_profit == pytest.approx(Decimal("110"), abs=Decimal("0.01"))

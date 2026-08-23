@@ -6,6 +6,7 @@
     coinbot paper                    trade on live data with simulated money
     coinbot run                      trade for real (requires --i-understand-the-risk)
     coinbot backtest                 replay history through the same loop
+    coinbot optimize                 fit parameters on real data, validate out of sample
     coinbot fetch                    download candles for offline backtesting
     coinbot status                   report saved state from the database
 """
@@ -29,6 +30,10 @@ from .execution.live import LiveBroker
 from .execution.paper import PaperBroker
 from .logging_setup import setup_logging
 from .models import Candle, Granularity
+from .optimize.objective import OBJECTIVES
+from .optimize.robustness import deflated_sharpe, monte_carlo, returns_from_curve
+from .optimize.space import PRESETS, SearchSpace, SpaceError
+from .optimize.walkforward import WalkForwardOptimizer, WalkForwardResult
 from .regime.detector import RegimeDetector
 from .storage.state import StateStore
 from .util.numeric import to_decimal
@@ -78,6 +83,48 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--bars", type=int, default=3000, help="bars to download if not cached")
     backtest.add_argument("--equity", type=float, help="starting equity")
     backtest.add_argument("--json", action="store_true", help="emit machine-readable results")
+
+    optimize = sub.add_parser(
+        "optimize",
+        help="fit parameters on historical data and validate them out of sample",
+    )
+    optimize.add_argument(
+        "--space", default="fast",
+        help=f"preset ({', '.join(sorted(PRESETS))}) or a YAML/JSON file of "
+             f"path -> [values]",
+    )
+    optimize.add_argument("--list-spaces", action="store_true", help="show the presets and exit")
+    optimize.add_argument(
+        "--objective", default=None, choices=sorted(OBJECTIVES),
+        help="what to rank configurations by (default: risk_adjusted)",
+    )
+    optimize.add_argument("--folds", type=int, default=4, help="train/test splits")
+    optimize.add_argument(
+        "--test-fraction", type=float, default=0.25,
+        help="share of each fold held back for validation",
+    )
+    optimize.add_argument(
+        "--anchored", action="store_true",
+        help="expand the training window from the start instead of rolling it",
+    )
+    optimize.add_argument(
+        "--budget", type=int,
+        help="sample this many configurations instead of the full grid",
+    )
+    optimize.add_argument("--seed", type=int, default=0, help="sampling seed")
+    optimize.add_argument("--jobs", type=int, default=1, help="parallel worker processes")
+    optimize.add_argument("--data", help="directory of cached candle JSON files")
+    optimize.add_argument("--bars", type=int, default=6000, help="bars to download if not cached")
+    optimize.add_argument("--equity", type=float, help="starting equity")
+    optimize.add_argument(
+        "--simulations", type=int, default=2000,
+        help="Monte Carlo paths to resample (0 to skip)",
+    )
+    optimize.add_argument(
+        "--write-config", metavar="PATH",
+        help="save the validated parameters to a YAML file",
+    )
+    optimize.add_argument("--json", action="store_true", help="emit machine-readable results")
 
     fetch = sub.add_parser("fetch", help="download candles for offline backtesting")
     fetch.add_argument("--bars", type=int, default=3000)
@@ -135,6 +182,53 @@ def load_candles(directory: str, product_id: str, granularity: str) -> Optional[
         )
         for r in raw
     ]
+
+
+def gather_candles(
+    cfg: Config, directory: str, bars: int, *, quiet: bool = False
+) -> tuple:
+    """Cached candles for every configured product, downloading what is missing.
+
+    Shared by ``backtest`` and ``optimize`` so the two always replay exactly
+    the same data — a tuned parameter set validated on one set of bars and
+    then backtested on another would be comparing two different experiments.
+    """
+    candles: Dict[str, List[Candle]] = {}
+    htf: Dict[str, List[Candle]] = {}
+    client: Optional[CoinbaseClient] = None
+    granularity = cfg.trading.granularity
+
+    def say(message: str) -> None:
+        if not quiet:
+            print(message)
+
+    for product_id in cfg.trading.products:
+        cached = load_candles(directory, product_id, granularity)
+        if cached:
+            candles[product_id] = cached
+            htf_cached = load_candles(directory, product_id, cfg.trading.htf_granularity)
+            if htf_cached:
+                htf[product_id] = htf_cached
+            say(f"loaded {len(cached)} cached bars for {product_id}")
+            continue
+
+        if client is None:
+            client = CoinbaseClient(cfg.api)
+        say(f"downloading {bars} bars for {product_id}...")
+        try:
+            downloaded = client.get_candles_paged(
+                product_id, cfg.trading.granularity_enum, bars=bars
+            )
+        except ExchangeError as exc:
+            print(f"  failed: {exc}", file=sys.stderr)
+            continue
+        if downloaded:
+            candles[product_id] = downloaded
+            save_candles(directory, product_id, granularity, downloaded)
+
+    if client is not None:
+        client.close()
+    return candles, htf
 
 
 # --------------------------------------------------------------------------- #
@@ -315,38 +409,7 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
     if args.equity:
         cfg.backtest.initial_equity = args.equity
     directory = args.data or cfg.backtest.data_dir
-    granularity = cfg.trading.granularity
-
-    candles: Dict[str, List[Candle]] = {}
-    htf: Dict[str, List[Candle]] = {}
-    client: Optional[CoinbaseClient] = None
-
-    for product_id in cfg.trading.products:
-        cached = load_candles(directory, product_id, granularity)
-        if cached:
-            candles[product_id] = cached
-            htf_cached = load_candles(directory, product_id, cfg.trading.htf_granularity)
-            if htf_cached:
-                htf[product_id] = htf_cached
-            print(f"loaded {len(cached)} cached bars for {product_id}")
-            continue
-
-        if client is None:
-            client = CoinbaseClient(cfg.api)
-        print(f"downloading {args.bars} bars for {product_id}...")
-        try:
-            downloaded = client.get_candles_paged(
-                product_id, cfg.trading.granularity_enum, bars=args.bars
-            )
-        except ExchangeError as exc:
-            print(f"  failed: {exc}", file=sys.stderr)
-            continue
-        if downloaded:
-            candles[product_id] = downloaded
-            save_candles(directory, product_id, granularity, downloaded)
-
-    if client is not None:
-        client.close()
+    candles, htf = gather_candles(cfg, directory, args.bars, quiet=args.json)
     if not candles:
         print("no data to backtest; try 'coinbot fetch' first", file=sys.stderr)
         return 1
@@ -357,6 +420,231 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
     else:
         print(result.render())
     return 0
+
+
+def load_space(spec: str) -> SearchSpace:
+    """A preset name, or a YAML/JSON file mapping config paths to value lists."""
+    if spec in PRESETS:
+        return SearchSpace.preset(spec)
+
+    path = Path(spec).expanduser()
+    if not path.exists():
+        raise SpaceError(
+            f"'{spec}' is neither a preset nor a file. Presets: "
+            f"{', '.join(sorted(PRESETS))}"
+        )
+    text = path.read_text()
+    if path.suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError:
+            raise SpaceError("PyYAML is required to read a YAML search space") from None
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+    return SearchSpace.from_dict(data or {})
+
+
+def describe_spaces() -> int:
+    print("Built-in search spaces:\n")
+    for name in sorted(PRESETS):
+        space = SearchSpace.preset(name)
+        print(f"  {name}  ({space.size:,} combinations)")
+        for path, values in sorted(space.dimensions.items()):
+            rendered = ", ".join(str(v) for v in values)
+            print(f"      {path:<44} {rendered}")
+        print()
+    print("Or pass a YAML file:  path.to.setting: [value, value, ...]")
+    return 0
+
+
+def nest(values: Dict[str, object]) -> Dict[str, object]:
+    """Turn ``{'risk.take_profit_r': 3.0}`` into ``{'risk': {'take_profit_r': 3.0}}``."""
+    out: Dict[str, object] = {}
+    for path, value in sorted(values.items()):
+        cursor = out
+        parts = path.split(".")
+        for part in parts[:-1]:
+            cursor = cursor.setdefault(part, {})  # type: ignore[assignment]
+        cursor[parts[-1]] = value
+    return out
+
+
+def write_tuned_config(path: str, result: WalkForwardResult) -> None:
+    """Save the consensus parameters, with the evidence for them in a header.
+
+    Only the tuned keys are written, not a whole config. A partial file layers
+    over the defaults exactly like a hand-written one, and it stays readable —
+    the operator can see at a glance what the optimizer actually changed.
+    """
+    try:
+        import yaml
+    except ImportError:
+        raise ConfigError("PyYAML is required to write a config file") from None
+
+    consensus = result.consensus()
+    oos = result.oos_metrics
+    header = [
+        "# Parameters chosen by `coinbot optimize`.",
+        "#",
+        f"# Objective:        {result.objective}",
+        f"# Folds:            {len(result.folds)} "
+        f"({result.profitable_folds} profitable out of sample)",
+        f"# Configs tried:    {result.total_trials}",
+    ]
+    if oos is not None:
+        header += [
+            f"# Out-of-sample:    {oos.total_return:+.2%} return, "
+            f"{oos.max_drawdown:.2%} max drawdown, {oos.total_trades} trades",
+        ]
+    header += [
+        "#",
+        "# These were fitted on past data. That is not a forecast. Paper-trade",
+        "# them before risking anything, and re-run the optimizer periodically",
+        "# rather than treating these numbers as settled.",
+        "",
+    ]
+    body = yaml.safe_dump(nest(consensus.values), default_flow_style=False, sort_keys=True)
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(header) + body)
+
+
+def cmd_optimize(cfg: Config, args: argparse.Namespace) -> int:
+    if args.list_spaces:
+        return describe_spaces()
+
+    if args.equity:
+        cfg.backtest.initial_equity = args.equity
+
+    space = load_space(args.space)
+    directory = args.data or cfg.backtest.data_dir
+    candles, htf = gather_candles(cfg, directory, args.bars, quiet=args.json)
+    if not candles:
+        print("no data to optimize on; try 'coinbot fetch' first", file=sys.stderr)
+        return 1
+
+    optimizer = WalkForwardOptimizer(
+        cfg,
+        space,
+        objective=args.objective,
+        folds=args.folds,
+        test_fraction=args.test_fraction,
+        anchored=args.anchored,
+        budget=args.budget,
+        seed=args.seed,
+        jobs=args.jobs,
+    )
+
+    total = len(space.candidates(args.budget, seed=args.seed))
+    if not args.json:
+        print(
+            f"\nSearching {total} configuration(s) over {args.folds} folds. "
+            f"This runs {total * args.folds + args.folds * 2} backtests; "
+            f"expect it to take a while.\n"
+        )
+
+    try:
+        result = optimizer.run(
+            candles,
+            htf_candles=htf or None,
+            on_progress=None if args.json else (lambda message: print(f"  {message}")),
+        )
+    except (ValueError, SpaceError) as exc:
+        print(f"optimization failed: {exc}", file=sys.stderr)
+        return 1
+
+    payload: Dict[str, object] = result.to_dict()
+
+    # --- Robustness, on the stitched out-of-sample curve only --------- #
+    mc = None
+    ds = None
+    oos_trades = [t for fold in result.folds for t in fold.test_trades]
+    if args.simulations > 0 and oos_trades:
+        mc = monte_carlo(
+            oos_trades,
+            starting_equity=cfg.backtest.initial_equity,
+            simulations=args.simulations,
+            seed=args.seed,
+        )
+        payload["monte_carlo"] = mc.to_dict()
+    if result.oos_equity_curve:
+        ds = deflated_sharpe(
+            returns_from_curve(result.oos_equity_curve),
+            trials=max(1, result.total_trials),
+            trial_sharpes=result.trial_sharpes() or None,
+        )
+        payload["deflated_sharpe"] = ds.to_dict()
+
+    if args.write_config:
+        write_tuned_config(args.write_config, result)
+        payload["written_to"] = args.write_config
+
+    if args.json:
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+
+    print()
+    print(result.render())
+    if mc is not None:
+        print()
+        print(mc.render())
+    if ds is not None:
+        print()
+        print(ds.render())
+
+    print()
+    print(verdict(result, ds))
+    if args.write_config:
+        print(f"\nWrote the validated parameters to {args.write_config}")
+        print("Paper-trade them before using them with real money.")
+    return 0
+
+
+def verdict(result: WalkForwardResult, ds: Optional[object]) -> str:
+    """A plain-language read of whether this result is worth acting on.
+
+    Deliberately blunt, and deliberately biased toward "not yet". The failure
+    mode this guards against is an operator seeing a positive number, skipping
+    the diagnostics above it, and funding the account.
+    """
+    reasons: List[str] = []
+    oos = result.oos_metrics
+
+    if oos is None or oos.total_trades == 0:
+        return "VERDICT: no out-of-sample trades. Nothing has been demonstrated."
+
+    if oos.total_return <= 0:
+        reasons.append(f"the out-of-sample return is {oos.total_return:.2%}")
+    if result.profitable_folds * 2 < len(result.folds):
+        reasons.append(
+            f"only {result.profitable_folds} of {len(result.folds)} test folds made money"
+        )
+    if oos.total_trades < 30:
+        reasons.append(f"{oos.total_trades} trades is too few to conclude anything")
+    if ds is not None and not getattr(ds, "passes", False):
+        reasons.append(
+            "the Sharpe does not clear the bar set by how many configurations were tried"
+        )
+    baseline = result.baseline_metrics
+    if baseline is not None and oos.total_return <= baseline.total_return:
+        reasons.append("the untuned defaults did at least as well")
+
+    if reasons:
+        return (
+            "VERDICT: do not trade this configuration with real money.\n"
+            + "\n".join(f"  - {reason}" for reason in reasons)
+            + "\n\n  Fitting harder is not the fix. A search that has to be run"
+            "\n  repeatedly until it produces a good number is producing that"
+            "\n  number by selection, not by finding an edge."
+        )
+
+    return (
+        "VERDICT: this configuration survived out-of-sample validation.\n"
+        "  That is the minimum bar for consideration, not a green light. Paper-trade\n"
+        "  it for weeks and compare the live results against these numbers before\n"
+        "  risking anything. If they disagree, believe the live results."
+    )
 
 
 def cmd_fetch(cfg: Config, args: argparse.Namespace) -> int:
@@ -434,6 +722,7 @@ COMMANDS = {
     "paper": cmd_paper,
     "run": cmd_run,
     "backtest": cmd_backtest,
+    "optimize": cmd_optimize,
     "fetch": cmd_fetch,
     "status": cmd_status,
 }

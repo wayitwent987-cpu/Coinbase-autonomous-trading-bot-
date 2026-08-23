@@ -39,3 +39,6 @@ include = ["coinbot*"]
 testpaths = ["tests"]
 pythonpath = [".", "tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+# Walk-forward tests run many backtests each. Skip them with -m "not slow"
+# while iterating; run the whole suite before pushing.
+markers = ["slow: runs several full backtests (tens of seconds each)"]

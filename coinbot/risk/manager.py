@@ -388,11 +388,16 @@ class RiskManager:
 
         # --- 1. Risk-based size ---------------------------------------- #
         stop = to_decimal(stop_price) if stop_price is not None else None
-        if stop is None or stop <= 0 or (direction > 0 and stop >= price) or (
-            direction < 0 and stop <= price
+        if (
+            cfg.override_strategy_exits
+            or stop is None
+            or stop <= 0
+            or (direction > 0 and stop >= price)
+            or (direction < 0 and stop <= price)
         ):
-            # No usable stop: fall back to an ATR-derived one so we never size
-            # against a zero (or negative) risk distance.
+            # Either the operator has taken control of exits portfolio-wide, or
+            # there is no usable stop and we must not size against a zero (or
+            # negative) risk distance.
             atr = to_decimal(features.atr_or() if features else float(price) * 0.01)
             stop = price - to_decimal(direction) * to_decimal(cfg.atr_stop_multiple) * atr
 
@@ -441,7 +446,9 @@ class RiskManager:
             notional=notional,
             risk_amount=size * stop_distance,
             stop_price=stop,
-            take_profit=to_decimal(take_profit) if take_profit is not None else None,
+            take_profit=self._target_for(
+                price, direction, stop_distance, proposed=take_profit
+            ),
             binding_constraint=binding,
             detail={k: float(v * price) for k, v in candidates.items()},
         )
@@ -463,6 +470,34 @@ class RiskManager:
                 f"notional {notional:.2f} below exchange minimum {product.min_quote_size}"
             )
         return result
+
+    def _target_for(
+        self,
+        price: Decimal,
+        direction: int,
+        stop_distance: Decimal,
+        *,
+        proposed: Optional[Decimal],
+    ) -> Optional[Decimal]:
+        """The take-profit to attach — the strategy's, or one from ``take_profit_r``.
+
+        ``take_profit_r`` is expressed in multiples of the trade's *initial
+        risk*, so it is measured off the stop distance actually being used
+        after every clamp above. A target set from the pre-clamp distance would
+        promise a reward-to-risk the position does not have.
+
+        Set ``take_profit_r`` to 0 to run without a fixed target and let the
+        trailing stop decide when to leave.
+        """
+        cfg = self.cfg
+        strategy_target = to_decimal(proposed) if proposed is not None else None
+        if strategy_target is not None and not cfg.override_strategy_exits:
+            return strategy_target
+        if cfg.take_profit_r <= 0:
+            return None if cfg.override_strategy_exits else strategy_target
+        if stop_distance <= 0:
+            return strategy_target
+        return price + to_decimal(direction) * to_decimal(cfg.take_profit_r) * stop_distance
 
     def _annualized_vol(self, features: FeatureSet, bars_per_year: int) -> float:
         """Annualized volatility estimate, preferring realized over ATR."""
@@ -487,7 +522,7 @@ class RiskManager:
         """The stop to attach at entry — the strategy's, or an ATR default."""
         atr = to_decimal(features.atr_or() if features else float(price) * 0.01)
         default = price - to_decimal(direction) * to_decimal(self.cfg.atr_stop_multiple) * atr
-        if proposed is None:
+        if proposed is None or self.cfg.override_strategy_exits:
             return default
         proposed = to_decimal(proposed)
         # Reject a stop on the wrong side of the market.

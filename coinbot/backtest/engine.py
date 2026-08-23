@@ -33,6 +33,7 @@ class BacktestResult:
     trades: List[TradeRecord] = field(default_factory=list)
     equity_curve: List[tuple] = field(default_factory=list)
     bars: int = 0
+    bars_in_market: int = 0
     regime_counts: Dict[str, int] = field(default_factory=dict)
 
     def render(self) -> str:
@@ -152,6 +153,7 @@ class Backtester:
             trades=list(bot.book.trades),
             equity_curve=equity_curve,
             bars=bars,
+            bars_in_market=bars_in_market,
             regime_counts=regime_counts,
         )
 

@@ -64,12 +64,17 @@ risk:
   max_gross_exposure_pct: 0.90
   correlation_cap: 0.85       # BTC and ETH move together; treat as one bet
 
-  # ---- Stops ---------------------------------------------------------------
+  # ---- Stops and targets ---------------------------------------------------
+  # By default each strategy sets its own stop and target, and the two
+  # multiples below apply only when it does not. Set override_strategy_exits
+  # to true to put every strategy on these numbers instead — which is what
+  # makes them worth tuning as a pair with `coinbot optimize --space exits`.
+  override_strategy_exits: false
   atr_stop_multiple: 2.2      # initial stop, in units of recent volatility
   atr_trail_multiple: 3.0     # trailing stop distance
   use_trailing_stop: true
   breakeven_at_r: 1.0         # move stop to entry after +1x the risked amount
-  take_profit_r: 2.5
+  take_profit_r: 2.5          # target, in multiples of the amount risked; 0 = none
   max_bars_in_trade: 288      # give up on a trade going nowhere
   hard_stop_pct: 0.12         # absolute backstop per position
 

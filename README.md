@@ -69,6 +69,9 @@ would flag routine noise on a coin that swings 5% a bar.
 
 Stops only ever move in your favour. A stop that can loosen is not a stop.
 
+None of the controls in this table can be touched by `coinbot optimize` — see
+[Tuning](#tuning-the-part-that-decides-whether-this-makes-money) for why.
+
 ---
 
 ## Setup (about 10 minutes)
@@ -164,6 +167,7 @@ coinbot regime        # what condition is the market in right now?
 
 coinbot fetch         # download historical candles for backtesting
 coinbot backtest      # replay history through the real trading loop
+coinbot optimize      # fit parameters on real data, validate out of sample
 
 coinbot paper         # trade live prices with fake money  <-- START HERE
 coinbot status        # positions, trades, P&L
@@ -175,11 +179,14 @@ coinbot run --i-understand-the-risk    # real money
 
 1. **`coinbot fetch`** then **`coinbot backtest`** — see how the strategy would
    have behaved on real history. Look at max drawdown, not just return.
-2. **`coinbot paper`** — leave it running for at least a few weeks. This is the
+2. **`coinbot optimize`** — the parameters ship as guesses. This fits them on
+   real data and, more importantly, tells you how much of the improvement is
+   likely to survive. See [Tuning](#tuning-the-part-that-decides-whether-this-makes-money).
+3. **`coinbot paper`** — leave it running for at least a few weeks. This is the
    step people skip and regret.
-3. Compare paper results to the backtest. If they disagree badly, the backtest
+4. Compare paper results to the backtest. If they disagree badly, the backtest
    was optimistic. Do not proceed.
-4. Only then consider `coinbot run`, starting small.
+5. Only then consider `coinbot run`, starting small.
 
 `coinbot run` refuses to start without `--i-understand-the-risk`. That is
 intentional friction.
@@ -187,6 +194,146 @@ intentional friction.
 To stop the bot, press `Ctrl+C`. **Open positions are not closed automatically**
 — the bot will not panic-sell on shutdown. Close them yourself in the Coinbase
 app if you want to be flat.
+
+---
+
+## Tuning: the part that decides whether this makes money
+
+The strategy parameters ship as *reasonable guesses*. Tuning them on real data
+is the single largest lever on results — and it is also the easiest way to
+build something that backtests beautifully and loses money live.
+
+The reason is simple. Try enough parameter combinations and one of them will
+look excellent on any dataset, including pure noise. That is what "best of 400"
+means. It is not evidence of anything.
+
+So `coinbot optimize` does not just search. It searches on one slice of history
+and scores on the *next* slice, which the search never saw:
+
+```
+|------- train 1 -------|-- test 1 --|
+          |------- train 2 -------|-- test 2 --|
+                    |------- train 3 -------|-- test 3 --|
+```
+
+The test windows are stitched into one continuous out-of-sample equity curve.
+**That curve is the answer.** It tells you what would have happened if you had
+periodically re-tuned the bot using only the data available at the time — which
+is the only thing you can actually do going forward.
+
+### Running it
+
+```bash
+coinbot fetch --bars 20000          # more history is strictly better here
+coinbot optimize --space fast --jobs 4
+```
+
+`--jobs` matters: backtests are CPU-bound, and four workers run roughly 3–4x
+faster than one. Start with `--space fast` (12 configurations) to see how long
+a fold takes before committing to something larger.
+
+```bash
+coinbot optimize --list-spaces      # what each preset varies
+coinbot optimize --space exits      # stops, targets, trailing
+coinbot optimize --space sizing     # position size and concurrency
+coinbot optimize --space broad --budget 200 --jobs 8
+```
+
+A space larger than `--budget` is sampled randomly rather than enumerated.
+Random search beats grid search past a few dimensions — a grid spends most of
+its budget re-testing the same value of a parameter that turned out not to
+matter.
+
+To search your own parameters, write a YAML file:
+
+```yaml
+risk.override_strategy_exits: [true]
+risk.atr_stop_multiple: [1.8, 2.4, 3.0]
+strategy.params.trend_follow.adx_min: [18.0, 22.0, 28.0]
+```
+
+```bash
+coinbot optimize --space my_space.yaml --jobs 4
+```
+
+Any misspelled path is a startup error, not a silently ignored line.
+
+### What it will not let you optimize
+
+Risk limits, fee assumptions and credentials are rejected outright:
+
+```
+'risk.max_drawdown_pct' may not be optimized: it is a risk limit, a
+credential, or a cost assumption.
+```
+
+This is not paternalism, it is arithmetic. A search maximizing return will
+*always* discover that removing the drawdown halt improves the backtest — the
+run where the breaker never fired scores higher than the run where it saved the
+account. The same goes for lowering the assumed fee. Both make the number go up
+and the strategy no better.
+
+### Reading the output
+
+The report leads with the honesty checks, not the return:
+
+| What it says | What it means |
+|---|---|
+| **Profitable test folds** | `1/4` means the result rests on one lucky window |
+| **Median degradation** | How much of the in-sample edge vanished. Above 100% means it reversed |
+| **Parameter stability** | If each fold picked a different value, there is no stable optimum and the value you ship is arbitrary |
+| **Untuned config, same windows** | If tuning did not beat the defaults, ship the defaults |
+| **Monte Carlo** | Resamples your trades into thousands of alternative orderings |
+| **Deflated Sharpe** | The Sharpe a *worthless* strategy would post as the best of N tries |
+
+The Monte Carlo section is the one people most need and least want. Six losses
+scattered through a year is a rough patch; the same six consecutively is a 28%
+hole and a breached risk limit. Your backtest shows one ordering. Size for the
+95th-percentile drawdown, not the one you happened to observe.
+
+Finally the run prints a plain verdict, which is biased toward "not yet":
+
+```
+VERDICT: do not trade this configuration with real money.
+  - only 1 of 3 test folds made money
+  - 10 trades is too few to conclude anything
+  - the Sharpe does not clear the bar set by how many configurations were tried
+```
+
+**If you get this verdict, re-running the search with different settings until
+it goes away is exactly the mistake the whole tool exists to prevent.** A number
+you had to hunt for is a number you selected, not one you found.
+
+### Saving what you found
+
+```bash
+coinbot optimize --space exits --jobs 4 --write-config config/tuned.yaml
+coinbot -c config/tuned.yaml paper
+```
+
+`--write-config` saves the *consensus* across folds — the median choice, snapped
+to a value that was actually tested — rather than the last fold's winner, which
+is a single sample. The file records what it was fitted on:
+
+```yaml
+# Objective:        risk_adjusted
+# Folds:            4 (3 profitable out of sample)
+# Configs tried:    48
+# Out-of-sample:    +6.10% return, 4.20% max drawdown, 141 trades
+risk:
+  atr_stop_multiple: 2.8
+  override_strategy_exits: true
+  take_profit_r: 3.0
+```
+
+It contains only the keys that were tuned, layering over the defaults exactly
+like a hand-written config.
+
+### How often to re-run
+
+Market conditions change; parameters fitted to last year's tape are fitted to
+last year's tape. Re-running quarterly is reasonable. Re-running until you like
+the answer is not.
 
 ---
 
@@ -245,6 +392,9 @@ Coinbase API ──> exchange/     REST + JWT auth + WebSocket
                  execution/    Broker interface: live | paper | backtest
                     │
                  engine/       the loop      storage/  SQLite state
+
+                 optimize/     walk-forward fitting + overfit diagnostics
+                               (drives backtest/, never live)
 ```
 
 The seam that matters is `execution/broker.py`. Backtest, paper and live all
@@ -259,11 +409,20 @@ behaviour.
 
 - **Not validated on real market data.** The test suite proves the code does
   what it says on synthetic tapes with known properties. It does not show the
-  strategy has an edge. You must run your own backtests on real history.
+  strategy has an edge. You must run your own backtests on real history —
+  `coinbot optimize` exists to make that verdict honest, not to supply it.
 - **Backtest fills are assumptions.** Orders fill at the next bar's open, and
   a resting limit only fills if price traded *through* it, not merely touched
   it. These are deliberately conservative but they are still assumptions.
 - **Spot is long-only.** In a downtrend the bot mostly sits in cash.
 - **No slow-indicator support beyond EMA200** without raising `max_candles`.
 - **Strategy parameters were tuned on synthetic data**, so treat them as
-  starting points, not optimized values.
+  starting points, not optimized values. `coinbot optimize` fits them on real
+  history and reports how much of the fit is likely to survive.
+- **Walk-forward validation reduces overfitting; it does not eliminate it.**
+  Every fold still comes from one asset's history over one period, and you
+  choose the search space by hand. A clean out-of-sample result is the minimum
+  bar for consideration, not proof of an edge.
+- **The optimizer's out-of-sample curve assumes you would have re-tuned on the
+  same schedule it did.** Fit once and leave it running for a year and you are
+  not running the process that curve describes.

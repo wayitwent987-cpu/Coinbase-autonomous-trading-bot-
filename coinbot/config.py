@@ -133,6 +133,11 @@ class RiskConfig:
     atr_stop_multiple: float = 2.2
     atr_trail_multiple: float = 3.0
     take_profit_r: float = 2.5               # in multiples of initial risk
+    # By default a strategy's own stop and target win, and the two multiples
+    # above apply only when it supplies none. Turn this on to make the
+    # portfolio-level numbers authoritative for every strategy at once —
+    # which is what makes them worth optimizing as a single pair.
+    override_strategy_exits: bool = False
     use_trailing_stop: bool = True
     breakeven_at_r: float = 1.0              # move stop to entry after +1R
     max_bars_in_trade: int = 288             # time stop
@@ -388,6 +393,8 @@ class Config:
             problems.append("risk.max_drawdown_pct must be in (0, 1]")
         if r.atr_stop_multiple <= 0:
             problems.append("risk.atr_stop_multiple must be > 0")
+        if r.take_profit_r < 0:
+            problems.append("risk.take_profit_r must be >= 0 (0 disables the target)")
         if r.max_gross_exposure_pct <= 0:
             problems.append("risk.max_gross_exposure_pct must be > 0")
         if r.max_leverage < 1.0 and r.max_gross_exposure_pct > r.max_leverage:
