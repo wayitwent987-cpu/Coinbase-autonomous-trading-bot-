@@ -225,6 +225,34 @@ class StrategyConfig:
 
 
 @dataclass
+class AdaptiveConfig:
+    """Scale position size by how a strategy has actually performed.
+
+    This shrinks trades in (strategy, regime) combinations that have lost money
+    and modestly grows those that have earned it. It reduces repetition of a
+    demonstrated losing pattern; it does not predict the market.
+    """
+
+    enabled: bool = True
+    # Shrinkage constant: at this many trades the observed record carries half
+    # its full weight. Lower = adapts faster and chases noise more.
+    confidence_trades: int = 20
+    # Hard evidence floor: below this many trades the tracker stays neutral
+    # rather than reacting to a handful of results.
+    min_trades: int = 5
+    # Average net return per trade treated as "good" when scoring.
+    reference_return: float = 0.005
+    # Never size to zero: a banned combination stops producing the evidence
+    # needed to notice that conditions changed.
+    floor: float = 0.25
+    # Kept close to 1.0 on purpose. Sizing up after a winning streak is how
+    # accounts blow up, because streaks are the most common artifact of noise.
+    ceiling: float = 1.25
+    gain: float = 1.0
+    window: int = 50
+
+
+@dataclass
 class StorageConfig:
     db_path: str = "state/coinbot.sqlite3"
     persist_candles: bool = False
@@ -261,6 +289,7 @@ class Config:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    adaptive: AdaptiveConfig = field(default_factory=AdaptiveConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
@@ -574,6 +603,7 @@ def _apply_section(target: Any, values: Dict[str, Any], section_name: str) -> No
 
 
 __all__ = [
+    "AdaptiveConfig",
     "ApiConfig",
     "BacktestConfig",
     "Config",

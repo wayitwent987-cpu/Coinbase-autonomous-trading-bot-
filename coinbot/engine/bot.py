@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Dict, List, Optional, Sequence
 
+from ..adaptive.performance import PerformanceTracker
 from ..config import Config
 from ..data.candles import CandleSeries
 from ..data.features import (
@@ -97,6 +98,16 @@ class TradingBot:
         self.risk = RiskManager(config.risk)
         self.execution = ExecutionEngine(broker, config.execution, config.risk)
         self.book = PositionBook(quote_currency=config.trading.quote_currency)
+        self.performance = PerformanceTracker(
+            confidence_trades=config.adaptive.confidence_trades,
+            min_trades=config.adaptive.min_trades,
+            reference_return=config.adaptive.reference_return,
+            floor=config.adaptive.floor,
+            ceiling=config.adaptive.ceiling,
+            gain=config.adaptive.gain,
+            window=config.adaptive.window,
+            enabled=config.adaptive.enabled,
+        )
 
         self.state: Dict[str, ProductState] = {
             pid: ProductState(product_id=pid) for pid in config.trading.products
@@ -211,6 +222,10 @@ class TradingBot:
                 self.book.stats.peak_equity, to_decimal(peak)
             )
             log.info("restored equity peak: %.2f", self.book.stats.peak_equity)
+
+        stored_performance = self.store.get_meta("performance")
+        if stored_performance:
+            self.performance.load_json(stored_performance)
 
         halt = self.store.get_meta("halt_reason")
         if halt:
@@ -387,9 +402,11 @@ class TradingBot:
             humanize_duration(trade.duration_s), trade.strategy, trade.exit_reason,
         )
         self.risk.on_trade_closed(trade)
+        self.performance.record_trade(trade)
         if self.store is not None:
             self.store.record_trade(trade)
             self.store.delete_position(trade.product_id)
+            self.store.set_meta("performance", self.performance.to_json())
 
     def _refresh_account(self) -> None:
         try:
@@ -498,12 +515,18 @@ class TradingBot:
         direction = decision.direction
 
         stop = self.risk.initial_stop(price, direction, state.features, decision.stop_price)
+
+        # Scale by how this strategy has actually performed in this regime.
+        # Neutral (1.0) until there is enough history to say anything.
+        learned = self.performance.multiplier_for(decision.strategy, decision.regime)
+        conviction = decision.sized_conviction * learned
+
         sizing = self.risk.size_position(
             product=state.product,
             price=price,
             direction=direction,
             stop_price=stop,
-            conviction=decision.sized_conviction,
+            conviction=conviction,
             equity=equity,
             available_cash=self.account.available_cash or self.book.cash,
             book=self.book,
@@ -520,11 +543,11 @@ class TradingBot:
         side = Side.BUY if direction > 0 else Side.SELL
         log.info(
             "ENTRY %s %s %s size=%s notional=%.2f risk=%.2f stop=%s target=%s "
-            "[%s/%s conv=%.2f] %s",
+            "[%s/%s conv=%.2f x%.2f learned] %s",
             side.value, state.product_id, decision.regime.value, sizing.size,
             sizing.notional, sizing.risk_amount, sizing.stop_price, sizing.take_profit,
             decision.strategy, sizing.binding_constraint, decision.sized_conviction,
-            decision.reason,
+            learned, decision.reason,
         )
 
         if self.cfg.trading.dry_run and self.broker.is_live:
@@ -726,6 +749,12 @@ class TradingBot:
                 pid: s.regime.regime.value for pid, s in self.state.items()
             },
             "risk": self.risk.status(),
+            "adaptive": {
+                f"{s.strategy}/{s.regime}": round(
+                    self.performance.multiplier(s.strategy, s.regime), 3
+                )
+                for s in self.performance.all_stats()
+            },
             "trades": self.book.stats.total_trades,
             "win_rate": self.book.stats.win_rate,
         }

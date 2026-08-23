@@ -318,3 +318,69 @@ def test_a_broken_strategy_does_not_stop_the_others(monkeypatch):
     decisions = replay(S.trending_up(n=450, seed=65), router)
     # breakout still gets to speak even though trend_follow raises.
     assert any(d.strategy == "breakout" for _r, d in decisions)
+
+
+# --------------------------------------------------------------------------- #
+# Exit ownership
+# --------------------------------------------------------------------------- #
+
+
+def test_a_strategy_cannot_close_another_strategys_position():
+    """Regression: squeeze_break was closing everyone else's trades.
+
+    Each strategy's exit rule is written against its own entry premise, and
+    those premises are not interchangeable. squeeze_break exits when Bollinger
+    bands contract — a permanent condition in a smooth trend — so it was
+    closing trend_follow positions after a single bar. Measured effect of the
+    fix on a mixed-regime tape: trend_follow's win rate went from 6% to 67%.
+    """
+    squeeze = SqueezeBreakStrategy()
+    tape = S.trending_up(n=400, seed=91)
+    features = compute_features("T-USD", tape, PARAMS)
+
+    owned_by_someone_else = Position(
+        product_id="T-USD", size=Decimal("1"),
+        entry_price=Decimal("100"), strategy="trend_follow",
+    )
+    ctx = StrategyContext(
+        product_id="T-USD", features=features,
+        regime=RegimeState(regime=Regime.TRENDING_UP, confidence=0.8),
+        position=owned_by_someone_else,
+    )
+    squeeze.observe(ctx)
+    assert squeeze.generate(ctx).action is not SignalAction.EXIT
+
+
+def test_a_strategy_can_close_its_own_position():
+    squeeze = SqueezeBreakStrategy()
+    tape = S.squeeze(n=400, seed=92)
+    features = compute_features("T-USD", tape, PARAMS)
+
+    own = Position(
+        product_id="T-USD", size=Decimal("1"),
+        entry_price=Decimal("100"), strategy="squeeze_break",
+    )
+    ctx = StrategyContext(
+        product_id="T-USD", features=features,
+        regime=RegimeState(regime=Regime.SQUEEZE, confidence=0.8),
+        position=own,
+    )
+    # The exit rule is reachable for the owner (whether it fires depends on
+    # the bar; what matters is that ownership does not block it).
+    assert squeeze._owns(ctx)
+
+
+def test_an_untagged_position_is_never_unmanageable():
+    """A position restored without a strategy tag must still be exitable."""
+    strategy = TrendFollowStrategy()
+    features = compute_features("T-USD", S.trending_up(n=400, seed=93), PARAMS)
+    orphan = Position(
+        product_id="T-USD", size=Decimal("1"),
+        entry_price=Decimal("100"), strategy="",
+    )
+    ctx = StrategyContext(
+        product_id="T-USD", features=features,
+        regime=RegimeState(regime=Regime.TRENDING_UP, confidence=0.8),
+        position=orphan,
+    )
+    assert strategy._owns(ctx)

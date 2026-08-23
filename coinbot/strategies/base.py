@@ -107,10 +107,18 @@ class Strategy(ABC):
         if not ctx.features.is_complete or ctx.features.n_bars < self.min_bars:
             return Signal.hold(ctx.product_id, self.name, "warming up")
 
-        # An open position always gets an exit check, even in a regime this
-        # strategy would not newly enter — otherwise a regime flip would strand
-        # the position with nobody willing to manage it.
-        if ctx.in_position:
+        # An open position gets an exit check even in a regime this strategy
+        # would not newly enter — otherwise a regime flip would strand the
+        # position with nobody willing to manage it.
+        #
+        # But only the strategy that *opened* the position may close it. Every
+        # strategy's exit rule is written against its own entry premise, and
+        # those premises are not interchangeable: squeeze_break exits when
+        # volatility contracts, which is a permanent condition in a smooth
+        # trend and would close a trend-follower's position every single bar.
+        # The risk manager's stops are the universal safety net; strategy exits
+        # are not.
+        if ctx.in_position and self._owns(ctx):
             exit_signal = self.evaluate_exit(ctx)
             if exit_signal is not None:
                 return exit_signal
@@ -164,6 +172,18 @@ class Strategy(ABC):
         Defaults to no opinion; the risk manager's stops always apply on top.
         """
         return None
+
+    def _owns(self, ctx: StrategyContext) -> bool:
+        """True when this strategy opened the open position.
+
+        An untagged position (restored from an older state file, or opened
+        before attribution existed) is fair game for any strategy, so it can
+        never become unmanageable.
+        """
+        if ctx.position is None:
+            return False
+        owner = ctx.position.strategy
+        return not owner or owner == self.name
 
     def accepts_regime(self, regime: Regime) -> bool:
         return not self.suitable_regimes or regime in self.suitable_regimes
